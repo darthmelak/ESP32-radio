@@ -1,55 +1,95 @@
+#define CONFIG_JSON_SIZE 1024
+
 #include <Arduino.h>
 #include <WifiConfig.hpp>
 #include <SerialHandler.hpp>
 #include <BluetoothA2DPSink.h>
 #include <Audio.h>
 #include <OneButton.h>
+#include <Wire.h>
+#include <Adafruit_SH110X.h>
+#include <arduino-timer.h>
+#include <time.h>
+#include "defines.hpp"
 #include "secrets.h"
 
-#define I2S_BCK_PIN 26
-#define I2S_WS_PIN 25
-#define I2S_DOUT_PIN 17
-
-enum Modes {
-  LINE_IN,
-  WEB_RADIO,
-  BT_SINK
-};
 RTC_NOINIT_ATTR int mode;
+RTC_NOINIT_ATTR int station;
 
-bool debug = true;
+bool debug = false;
 WifiConfig wifiConfig(WIFI_SSID, WIFI_PASSWORD, "ESP32 Kitchen-Radio", "kitchen-radio", AUTH_USER, AUTH_PASS, true, true, debug);
-Configuration outputs("/outputs", debug);
 BluetoothA2DPSink a2dp_sink;
 Audio *audio = nullptr;
-OneButton modeSw(GPIO_NUM_5);
+Timer<1> timer;
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+OneButton whiteBtn(WHITE_BTN_PIN);
+OneButton redBtn(RED_BTN_PIN);
+OneButton blackBtn(BLACK_BTN_PIN);
+StaticJsonDocument<512> stationsList;
+char stationName[10];
+SavedIntConfig *volumeConfig = nullptr;
 
 void switchModeTo(int);
 void setupWebserver();
 void setupAudio();
+void setupButtons();
+void updateDisplay();
 void serialCb(String);
+void metadataCb(uint8_t, const uint8_t*);
 
 void setup() {
   if (debug) { Serial.begin(115200); delay(10); }
+  // set mode to default if not coming from deep sleep/reset
   esp_reset_reason_t reason = esp_reset_reason();
   if ((reason != ESP_RST_DEEPSLEEP) && (reason != ESP_RST_SW)) {
     mode = LINE_IN;
+    station = 0;
   }
 
+  // setup relay pins
+  pinMode(RELAY_1_PIN, OUTPUT);
+  pinMode(RELAY_2_PIN, OUTPUT); // relay 2 is not switched yet
+  configTzTime(CLOCK_TIMEZONE, NTP_SERVER);
+  // setup display
+  Wire.begin();
+  if (display.begin(SCREEN_ADDRESS, true)) {
+    if (debug) Serial.println(F("SH110X started"));
+    display.setRotation(2);
+    updateDisplay();
+  }
+
+  deserializeJson(stationsList, DEFAULT_STATIONS);
+  wifiConfig.getConfig().add("volume", DEFAULT_VOLUME, [](int value) {
+    int volume = value;
+    if (volume < 0) volume = 0;
+    if (volume > 21) volume = 21;
+    if (audio) audio->setVolume(volume);
+  });
   wifiConfig.setup();
+  volumeConfig = wifiConfig.getConfig().getInt("volume");
   setupAudio();
-  modeSw.attachClick([]() { switchModeTo(mode + 1); });
-  pinMode(GPIO_NUM_13, OUTPUT);
-  outputs.add("13", LOW, [](int value) { digitalWrite(GPIO_NUM_13, value); });
-  if (mode == LINE_IN) wifiConfig.registerConfigApi(outputs);
+  setupButtons();
   setupWebserver();
+  // update display every second
+  timer.every(1000, [](void*) -> bool { updateDisplay(); return true; });
 }
 
 void loop() {
   wifiConfig.loop();
-  modeSw.tick();
+  whiteBtn.tick();
+  redBtn.tick();
+  blackBtn.tick();
+  timer.tick();
   if (audio) audio->loop();
   handleSerial(debug, serialCb);
+
+  if (wifiConfig.isWifiConnected() && audio && audio->isRunning() == false) {
+    JsonArray arr = stationsList.as<JsonArray>();
+    if (arr.size() > 0) {
+      audio->connecttohost(arr[station].as<const char*>());
+      if (debug) Serial.printf("Playing  %s\n", arr[station].as<const char*>());
+    }
+  }
 }
 
 void switchModeTo(int newMode) {
@@ -69,8 +109,9 @@ void switchModeTo(int newMode) {
       break;
   }
 
+  if (newMode < 0) newMode = 2;
   mode = newMode % 3;
-  ESP.restart();
+  ESP.deepSleep(SLEEP_TIME);
 }
 
 void setupWebserver() {
@@ -82,14 +123,15 @@ void setupWebserver() {
     StaticJsonDocument<512> json;
     deserializeJson(json, body);
     JsonObject obj = json.as<JsonObject>();
-    StaticJsonDocument<256> responseJson;
+    StaticJsonDocument<128> responseJson;
 
     if (mode != WEB_RADIO) {
       responseJson["error"] = "Not in web radio mode";
     } else {
       if (obj.containsKey("url")) {
-        audio->connecttohost(obj["url"].as<String>().c_str());
-        if (debug) Serial.println("Playing  " + obj["url"].as<String>());
+        String url = obj["url"].as<String>();
+        audio->connecttohost(url.c_str());
+        if (debug) Serial.printf("Playing  %s\n", url.c_str());
         responseJson["status"] = "ok";
       } else {
         responseJson["error"] = "No url given";
@@ -105,6 +147,7 @@ void setupWebserver() {
 void setupAudio() {
   if (mode == BT_SINK) {
     if (debug) Serial.println(F("Starting BT sink"));
+    digitalWrite(RELAY_1_PIN, HIGH);
     i2s_pin_config_t my_pin_config = {
       .bck_io_num = I2S_BCK_PIN,
       .ws_io_num = I2S_WS_PIN,
@@ -114,14 +157,110 @@ void setupAudio() {
     a2dp_sink.set_pin_config(my_pin_config);
     a2dp_sink.activate_pin_code(false);
     a2dp_sink.set_auto_reconnect(false);
+    a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE);
+    a2dp_sink.set_avrc_metadata_callback(metadataCb);
     a2dp_sink.start(wifiConfig.getConfig().get("name")->getValue().c_str());
   } else if (mode == WEB_RADIO) {
     if (debug) Serial.println(F("Starting WebRadio"));
-    // audio = new Audio(false, 3, I2S_NUM_1);
+    digitalWrite(RELAY_1_PIN, HIGH);
     audio = new Audio();
-    audio->setVolume(7);
     audio->setPinout(I2S_BCK_PIN, I2S_WS_PIN, I2S_DOUT_PIN);
+    audio->setVolume(volumeConfig->getIntVal());
   }
+}
+
+void setupButtons() {
+  whiteBtn.attachClick([]() {
+    switchModeTo(mode + 1);
+  });
+  whiteBtn.attachDoubleClick([]() {
+    switchModeTo(mode - 1);
+  });
+  redBtn.attachClick([]() {
+    if (mode == WEB_RADIO) {
+      if (debug) Serial.println(F("Switching channel.."));
+      station++;
+      JsonArray arr = stationsList.as<JsonArray>();
+      if (station >= arr.size()) station = 0;
+      if (audio) {
+        audio->stopSong();
+        audio->connecttohost(arr[station].as<const char*>());
+        if (debug) Serial.printf("Playing  %s\n", arr[station].as<const char*>());
+      }
+    }
+  });
+  redBtn.attachDoubleClick([]() {
+    if (mode == WEB_RADIO) {
+      if (debug) Serial.println(F("Switching channel.."));
+      station--;
+      JsonArray arr = stationsList.as<JsonArray>();
+      if (station < 0) station = arr.size() - 1;
+      if (audio) {
+        audio->stopSong();
+        audio->connecttohost(arr[station].as<const char*>());
+        if (debug) Serial.printf("Playing  %s\n", arr[station].as<const char*>());
+      }
+    }
+  });
+  blackBtn.attachClick([]() {
+    if (mode == WEB_RADIO) {
+      if (volumeConfig->getIntVal() < 21) volumeConfig->setValue(volumeConfig->getIntVal() + 1);
+    }
+  });
+  blackBtn.attachDoubleClick([]() {
+    if (mode == WEB_RADIO) {
+      if (volumeConfig->getIntVal() > 0) volumeConfig->setValue(volumeConfig->getIntVal() - 1);
+    }
+  });
+}
+
+void updateDisplay() {
+  struct tm timeinfo;
+  if (wifiConfig.isWifiConnected()) getLocalTime(&timeinfo);
+
+  display.clearDisplay();
+
+  display.setTextSize(1);             // Normal 1:1 pixel scale
+  display.setTextColor(SH110X_WHITE);        // Draw white text
+  display.setCursor(0,0);
+  switch (mode) {
+    case LINE_IN:
+      display.println("Line In");
+      break;
+    case WEB_RADIO:
+      display.print("Radio - Vol: ");
+      if (volumeConfig) display.print(volumeConfig->getValue());
+      else display.print("-");
+      display.println("/21");
+      break;
+    case BT_SINK:
+      display.print("BlueTooth - ");
+      if (a2dp_sink.is_connected()) display.println("*");
+      else display.println();
+      break;
+  }
+
+  display.setCursor(0, 14);
+  if (mode != LINE_IN) {
+    display.setTextSize(2);
+    display.println(stationName);
+    display.setCursor(0, 44);
+  } else {
+    display.setTextSize(3);
+  }
+  if (wifiConfig.isWifiConnected()) display.print(&timeinfo, "%H:%M");
+  else display.print("--:--");
+  if (mode != LINE_IN) {
+    display.setCursor(60, 48);
+    display.setTextSize(1);
+  } else {
+    display.setCursor(90, 18);
+    display.setTextSize(2);
+  }
+  if (wifiConfig.isWifiConnected()) display.println(&timeinfo, ":%S");
+  else display.println(":--");
+
+  display.display();
 }
 
 void serialCb(String cmd) {
@@ -135,9 +274,20 @@ void serialCb(String cmd) {
   }
 }
 
-void audio_info(const char *info){
-  if (debug) {
-    Serial.print(F("info        "));
-    Serial.println(info);
+void metadataCb(uint8_t type, const uint8_t *data) {
+  if (type == ESP_AVRC_MD_ATTR_TITLE) {
+    if (debug) { Serial.print(F("title       "));Serial.println((char*)data); }
+    strncpy(stationName, (char*)data, 10);
+    updateDisplay();
   }
+}
+
+void audio_info(const char *info){
+  if (debug) { Serial.print(F("info        "));Serial.println(info); }
+}
+
+void audio_showstation(const char *info){
+  if (debug) { Serial.print(F("station     "));Serial.println(info); }
+  strncpy(stationName, info, 10);
+  updateDisplay();
 }
