@@ -16,7 +16,7 @@
 RTC_NOINIT_ATTR int mode;
 RTC_NOINIT_ATTR int station;
 
-bool debug = false;
+bool debug = true;
 WifiConfig wifiConfig(WIFI_SSID, WIFI_PASSWORD, "ESP32 Kitchen-Radio", "kitchen-radio", AUTH_USER, AUTH_PASS, true, true, debug);
 BluetoothA2DPSink a2dp_sink;
 Audio *audio = nullptr;
@@ -28,6 +28,7 @@ OneButton blackBtn(BLACK_BTN_PIN);
 StaticJsonDocument<512> stationsList;
 char stationName[10];
 SavedIntConfig *volumeConfig = nullptr;
+int pirState = 1;
 
 void switchModeTo(int);
 void setupWebserver();
@@ -49,6 +50,7 @@ void setup() {
   // setup relay pins
   pinMode(RELAY_1_PIN, OUTPUT);
   pinMode(RELAY_2_PIN, OUTPUT); // relay 2 is not switched yet
+  pinMode(PIR_PIN, INPUT);
   configTzTime(CLOCK_TIMEZONE, NTP_SERVER);
   // setup display
   Wire.begin();
@@ -75,6 +77,7 @@ void setup() {
 }
 
 void loop() {
+  pirState = digitalRead(PIR_PIN);
   wifiConfig.loop();
   whiteBtn.tick();
   redBtn.tick();
@@ -89,6 +92,15 @@ void loop() {
       audio->connecttohost(arr[station].as<const char*>());
       if (debug) Serial.printf("Playing  %s\n", arr[station].as<const char*>());
     }
+  }
+
+  switch(mode) {
+    case LINE_IN:
+      delay(15);
+    case BT_SINK:
+      delay(10);
+    default:
+      delay(1);
   }
 }
 
@@ -171,12 +183,16 @@ void setupAudio() {
 
 void setupButtons() {
   whiteBtn.attachClick([]() {
-    switchModeTo(mode + 1);
-  });
-  whiteBtn.attachDoubleClick([]() {
-    switchModeTo(mode - 1);
+    if (mode == BT_SINK) {
+      switchModeTo(LINE_IN);
+    } else {
+      switchModeTo((mode + 1) % 2);
+    }
   });
   redBtn.attachClick([]() {
+    if (mode == LINE_IN) {
+      switchModeTo(BT_SINK);
+    }
     if (mode == WEB_RADIO) {
       if (debug) Serial.println(F("Switching channel.."));
       station++;
@@ -216,9 +232,13 @@ void setupButtons() {
 
 void updateDisplay() {
   struct tm timeinfo;
-  if (wifiConfig.isWifiConnected()) getLocalTime(&timeinfo);
-
   display.clearDisplay();
+  if (pirState == 0) {
+    display.display();
+    return;
+  }
+
+  if (wifiConfig.isWifiConnected()) getLocalTime(&timeinfo);
 
   display.setTextSize(1);             // Normal 1:1 pixel scale
   display.setTextColor(SH110X_WHITE);        // Draw white text

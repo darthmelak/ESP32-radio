@@ -21,6 +21,7 @@
 #define BLACK_BTN_PIN 23
 #define RELAY_1_PIN 27
 #define RELAY_2_PIN 16
+#define PIR_PIN 34
 
 enum Modes {
   LINE_IN,
