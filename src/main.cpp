@@ -1,5 +1,3 @@
-#define CONFIG_JSON_SIZE 1024
-
 #include <Arduino.h>
 #include <WifiConfig.hpp>
 #include <SerialHandler.hpp>
@@ -25,7 +23,6 @@ Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 OneButton whiteBtn(WHITE_BTN_PIN);
 OneButton redBtn(RED_BTN_PIN);
 OneButton blackBtn(BLACK_BTN_PIN);
-StaticJsonDocument<512> stationsList;
 char stationName[10];
 SavedIntConfig *volumeConfig = nullptr;
 int pirState = 1;
@@ -60,14 +57,17 @@ void setup() {
     updateDisplay();
   }
 
-  deserializeJson(stationsList, DEFAULT_STATIONS);
-  wifiConfig.getConfig().add("volume", DEFAULT_VOLUME, [](int value) {
-    int volume = value;
-    if (volume < 0) volume = 0;
-    if (volume > 21) volume = 21;
-    if (audio) audio->setVolume(volume);
-  });
-  wifiConfig.setup();
+  wifiConfig.getConfig()
+    .add("volume", DEFAULT_VOLUME, [](int value) {
+      int volume = value;
+      if (volume < 0) volume = 0;
+      if (volume > 21) volume = 21;
+      if (audio) audio->setVolume(volume);
+    })
+    .addJson("stations", DEFAULT_STATIONS, nullptr, 1024)
+  ;
+
+  wifiConfig.begin();
   volumeConfig = wifiConfig.getConfig().getInt("volume");
   setupAudio();
   setupButtons();
@@ -87,8 +87,10 @@ void loop() {
   handleSerial(debug, serialCb);
 
   if (wifiConfig.isWifiConnected() && audio && audio->isRunning() == false) {
-    JsonArray arr = stationsList.as<JsonArray>();
+    JsonVariantConst stationsList = wifiConfig.getConfig().getJson("stations")->getJsonVal();
+    JsonArrayConst arr = stationsList.as<JsonArrayConst>();
     if (arr.size() > 0) {
+      if (station >= arr.size()) station = 0;
       audio->connecttohost(arr[station].as<const char*>());
       if (debug) Serial.printf("Playing  %s\n", arr[station].as<const char*>());
     }
@@ -196,7 +198,8 @@ void setupButtons() {
     if (mode == WEB_RADIO) {
       if (debug) Serial.println(F("Switching channel.."));
       station++;
-      JsonArray arr = stationsList.as<JsonArray>();
+      JsonVariantConst stationsList = wifiConfig.getConfig().getJson("stations")->getJsonVal();
+      JsonArrayConst arr = stationsList.as<JsonArrayConst>();
       if (station >= arr.size()) station = 0;
       if (audio) {
         audio->stopSong();
@@ -209,7 +212,8 @@ void setupButtons() {
     if (mode == WEB_RADIO) {
       if (debug) Serial.println(F("Switching channel.."));
       station--;
-      JsonArray arr = stationsList.as<JsonArray>();
+      JsonVariantConst stationsList = wifiConfig.getConfig().getJson("stations")->getJsonVal();
+      JsonArrayConst arr = stationsList.as<JsonArrayConst>();
       if (station < 0) station = arr.size() - 1;
       if (audio) {
         audio->stopSong();

@@ -11,6 +11,7 @@
 #define DEFAULT_VOLUME 5
 #define DEFAULT_STATIONS "[\"http://stream.infostart.hu/lejatszo/index.html?sid=1\",\"http://radio.musorok.org/listen/jazzy/jazzy.mp3\",\"http://icast.connectmedia.hu/4736/mr1.mp3\"]"
 
+#define CONFIG_JSON_SIZE 1536
 #define SLEEP_TIME 100000
 
 #define I2S_BCK_PIN 26
